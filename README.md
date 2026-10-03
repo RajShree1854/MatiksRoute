@@ -176,6 +176,12 @@ cd matiksroute
 npm install
 ```
 
+> **Note:** If you don't have Visual Studio Build Tools installed, use:
+>
+> ```bash
+> npm install --ignore-scripts
+> ```
+
 ### 2. Set up environment variables
 
 ```bash
