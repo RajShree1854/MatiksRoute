@@ -13,8 +13,14 @@ import {
   RequestLog,
 } from '@/providers/types';
 import { compressMessages, CompressionMode } from '@/lib/compressor';
-import { buildRoutingStrategy } from '@/lib/classifier';
-import { isProviderAvailable, hasCapacityFor, recordUsage, selectByHeadroom } from '@/lib/quotaManager';
+import { buildRoutingStrategy, isForcedPriority } from '@/lib/classifier';
+import {
+  isProviderAvailable,
+  hasCapacityFor,
+  getRemainingTpm,
+  recordUsage,
+  selectByHeadroom,
+} from '@/lib/quotaManager';
 import { processMessagesForProvider } from '@/lib/modalityBridge';
 import { createResilientStream } from '@/lib/streamRelay';
 import { trimMessagesToTokenBudget } from '@/lib/tokenizer';
@@ -66,12 +72,15 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
     (p) => isProviderAvailable(p) && hasCapacityFor(p, estimatedTotalTokens),
   );
 
-  const effectiveChain =
-    capacityFiltered.length > 0
+  const effectiveChain = isForcedPriority
+    ? capacityFiltered
+    : capacityFiltered.length > 0
       ? selectByHeadroom(capacityFiltered)
-      : chain;
+      : chain.filter(isProviderAvailable);
 
-  const primaryProvider = effectiveChain[0];
+  const finalChain = effectiveChain.length > 0 ? effectiveChain : chain;
+
+  const primaryProvider = finalChain[0];
   const providers = buildProviders();
 
   const contextLimit = MODEL_CONTEXT_LIMIT[primaryProvider];
@@ -94,11 +103,16 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
     failoverBeforeRetry,
   };
 
-  const aiProviderChain = effectiveChain.map((name) => providers[name]);
+  const remainingBudgets: Record<string, number> = {};
+  for (const p of finalChain) {
+    remainingBudgets[p] = getRemainingTpm(p);
+  }
+
+  const aiProviderChain = finalChain.map((name) => providers[name]);
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
 
-  let outputTokenCount = 0;
+  const perProviderTokens = new Map<ProviderName, number>();
 
   (async () => {
     await writer.write(encoder.encode(`data: ${JSON.stringify(metaEvent)}\n\n`));
@@ -108,6 +122,10 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
         collectedEvents.push(event);
       },
       failoverBeforeRetry,
+      onProviderTokens: (provider, tokens) => {
+        perProviderTokens.set(provider, (perProviderTokens.get(provider) ?? 0) + tokens);
+      },
+      inputTokens: compressedTokens,
     });
 
     const reader = relayStream.getReader();
@@ -130,7 +148,7 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
         try {
           const parsed = JSON.parse(json);
           if (parsed?.type === 'token' && typeof parsed.content === 'string') {
-            outputTokenCount += Math.ceil(parsed.content.length / 4);
+            /* token counting is now done inside the relay per-provider */
           }
         } catch { /* skip */ }
       }
@@ -139,26 +157,35 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
     const fallbackEvents = collectedEvents.filter((e) => e.type === 'fallback') as FallbackEvent[];
     const midStreamEvents = collectedEvents.filter((e) => e.type === 'mid_stream_failover');
     const latencyMs = Date.now() - startTime;
-    const totalTokens = compressedTokens + outputTokenCount;
 
     const actualProvider: ProviderName =
       fallbackEvents.length > 0
         ? fallbackEvents[fallbackEvents.length - 1].to
         : primaryProvider;
 
+    let totalTokensUsed = 0;
+    for (const [provider, tokens] of perProviderTokens) {
+      const totalForProvider = compressedTokens + tokens;
+      recordUsage(provider as ProviderName, totalForProvider);
+      totalTokensUsed += totalForProvider;
+    }
+
+    if (perProviderTokens.size === 0) {
+      totalTokensUsed = compressedTokens;
+      recordUsage(actualProvider, compressedTokens);
+    }
+
     const doneEvent: DoneEvent = {
       type: 'done',
       provider: actualProvider,
       latencyMs,
-      tokensUsed: totalTokens,
+      tokensUsed: totalTokensUsed,
       fallbackCount: fallbackEvents.length,
       midStreamFailover: midStreamEvents.length > 0,
     };
 
     await writer.write(encoder.encode(`data: ${JSON.stringify(doneEvent)}\n\n`));
     await writer.close().catch(() => undefined);
-
-    recordUsage(actualProvider, totalTokens);
 
     const errorEvents = collectedEvents.filter(
       (e) => e.type === 'error',
@@ -169,7 +196,7 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
       timestamp: new Date().toISOString(),
       complexityTier: tier,
       smartRouteTarget: primaryProvider,
-      providerAttempted: effectiveChain.join(' → '),
+      providerAttempted: finalChain.join(' → '),
       providerSucceeded: actualProvider,
       fallbackTriggered: fallbackEvents.length > 0,
       midStreamFailover: midStreamEvents.length > 0,
