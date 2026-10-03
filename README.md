@@ -73,25 +73,29 @@ Three compression modes controlled by `COMPRESSION_MODE` env var:
 
 Average token savings: 2–12% depending on history length and prompt verbosity.
 
-### 5. AbortSignal-Based Mid-Stream Failover
-When a provider's stream fails mid-response, a dedicated `AbortController` per-attempt cleanly cancels the abandoned upstream connection instead of letting it hang until the 30-second timeout. The relay:
+### 5. Seamless Mid-Stream Failover & Context Continuation
+When a provider's stream fails mid-response (due to an API crash or hitting its exact TPM limit), a dedicated `AbortController` cleanly severs the network connection. To ensure the user experience is flawless, the relay performs **context continuation**:
 
-1. Records the count of tokens already streamed before the failure
-2. Emits a `mid_stream_failover` SSE event so the client knows a handoff occurred
-3. Immediately initializes a fresh stream from the next sibling provider
+1. Records the exact text and token count already streamed before the failure.
+2. Emits a `mid_stream_failover` SSE event so the client keeps the connection open.
+3. Injects the cut-off text back into the chat history as an assistant message, along with a strict system prompt instructing the fallback provider to continue seamlessly.
+4. The sibling model instantly resumes typing the exact incomplete sentence where the previous model dropped off.
 
-No partial response is injected into the next provider's context (which caused response duplication artifacts in the prior implementation). The sibling model generates a complete fresh response.
+### 6. Distributed Token Accounting & Strict TPM Enforcement
+MatiksRoute enforces Token-Per-Minute (TPM) budgets strictly at both the pre-flight and mid-stream levels:
+- **Distributed Billing**: If a request spans across two providers (e.g., Groq streams 177 tokens then fails over to Gemini for 323 tokens), the orchestrator accurately splits the bill, charging 177 to Groq and 323 to Gemini.
+- **Live Guillotine**: The stream relay calculates an exact remaining token budget before opening the connection. If the provider hits its exact TPM limit mid-generation, the router instantly cuts the connection and hands off to the fallback provider.
 
-### 6. Circuit Breaker (Proactive Cooldown)
+### 7. Circuit Breaker (Proactive Cooldown)
 When a provider returns `429 Too Many Requests`, the gateway parses the `Retry-After` header and places the provider in a hard cooldown. Future requests instantly skip the broken provider with zero network calls, eliminating wasted latency.
 
-### 7. Multi-Modal Content Bridge (powered by `sharp`)
+### 8. Multi-Modal Content Bridge (powered by `sharp`)
 Automatically handles vision content based on the routed provider's capabilities:
 - Provider **supports vision** → `passed` (forwarded as-is)
 - Provider **supports vision** but image is very large → `resized` (downscaled to 512×512)
 - Provider **does not support vision** → `stripped` (image removed, text-only request sent)
 
-### 8. Universal SSE Adapter Pattern
+### 9. Universal SSE Adapter Pattern
 OpenAI, Gemini, and Groq each have different streaming response formats. Three custom adapters normalize them all into a single unified SSE format:
 
 ```
@@ -103,7 +107,7 @@ data: {"type":"done","provider":"openai","latencyMs":1234,"tokensUsed":512,"fall
 data: [DONE]
 ```
 
-### 9. Asynchronous Telemetry & Observability
+### 10. Asynchronous Telemetry & Observability
 Every request writes a structured log to a local SQLite database (WAL mode). The write is detached from the request lifecycle using `Promise.resolve()`, ensuring disk I/O **never blocks the streaming response**.
 
 Logs include: timestamp, complexity tier, provider attempted, provider succeeded, fallback count, mid-stream failover flag, compression mode, image action, token counts, tokens saved %, latency, and full error strings from provider APIs.
@@ -275,8 +279,6 @@ Returns the live quota status of all three providers: TPM used, cooldown timer, 
 
 ## Known Limitations
 
-- **TPM estimation is approximate**: The pre-flight check estimates token cost as `inputTokens × 3`. Real output token counts are measured from the stream after the fact. If a response is unusually long, a provider could marginally exceed its budget before the next request.
 - **In-memory admission state**: Concurrency limits and quota state live in Node.js `global`. They reset on server restart. For multi-instance production deployments, replace with a distributed store like Redis.
 - **Image resizing is best-effort**: If `sharp` fails to process an image, the gateway degrades gracefully by stripping the image rather than crashing.
 - **Groq does not support vision natively**: Images sent to Groq are automatically stripped by the modality bridge.
-- **Mid-stream failover generates a fresh response**: The sibling provider restarts generation from scratch. Tokens already streamed to the client before the failover remain visible, but the continuation is a new response rather than a resumed sentence.
