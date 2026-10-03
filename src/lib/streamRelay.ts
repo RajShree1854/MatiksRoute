@@ -1,14 +1,12 @@
 import { AIProvider, AnyRoutingEvent, ChatMessage, ProviderName } from '@/providers/types';
 import { admitRequest, releaseRequest } from '@/lib/admissionController';
+import { getRemainingTpm } from '@/lib/quotaManager';
 
 export interface RelayOptions {
   onEvent: (event: AnyRoutingEvent) => void;
   failoverBeforeRetry?: boolean;
-}
-
-interface StreamAttempt {
-  provider: AIProvider;
-  abortController: AbortController;
+  onProviderTokens?: (provider: ProviderName, outputTokens: number) => void;
+  inputTokens: number;
 }
 
 export function createResilientStream(
@@ -17,26 +15,25 @@ export function createResilientStream(
   options: RelayOptions,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
-  const { onEvent, failoverBeforeRetry = true } = options;
+  const { onEvent, failoverBeforeRetry = true, onProviderTokens } = options;
 
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
 
   (async () => {
-    const attempted: ProviderName[] = [];
     let succeeded = false;
-    let activeAttempt: StreamAttempt | null = null;
+    let accumulatedPartial = '';
 
     for (let i = 0; i < providers.length; i++) {
       const provider = providers[i];
-      attempted.push(provider.name);
+      const nextProvider = providers[i + 1];
 
       const admitted = admitRequest(provider.name);
-      if (!admitted && failoverBeforeRetry && i < providers.length - 1) {
+      if (!admitted && failoverBeforeRetry && nextProvider) {
         emitEvent(writer, encoder, onEvent, {
           type: 'fallback',
           from: provider.name,
-          to: providers[i + 1].name,
+          to: nextProvider.name,
           reason: 'admission_rejected',
         });
         continue;
@@ -52,21 +49,44 @@ export function createResilientStream(
       }
 
       const abortController = new AbortController();
-      activeAttempt = { provider, abortController };
+
+      const attemptMessages = [...messages];
+      if (accumulatedPartial) {
+        attemptMessages.push({
+          role: 'assistant',
+          content: accumulatedPartial,
+        });
+        attemptMessages.push({
+          role: 'user',
+          content: 'Continue your previous response exactly from where it was cut off. Do not output any conversational filler, introductory remarks, or formatting like "Sure". Just output the immediate next words of the incomplete sentence.',
+        });
+      }
 
       let stream: ReadableStream<Uint8Array>;
       try {
-        stream = await provider.streamChat(messages, abortController.signal);
+        stream = await provider.streamChat(attemptMessages, abortController.signal);
       } catch (err) {
         releaseRequest(provider.name, false);
         const reason = err instanceof Error ? err.message : String(err);
         onEvent({ type: 'error', message: `${provider.name}: ${reason}` });
 
-        if (failoverBeforeRetry && i < providers.length - 1) continue;
+        if (failoverBeforeRetry && nextProvider) continue;
         break;
       }
 
-      const result = await drainStream(stream, writer, provider.name, providers[i + 1]?.name, onEvent);
+      const result = await drainStream(
+        stream,
+        writer,
+        provider.name,
+        nextProvider?.name,
+        onEvent,
+        options.inputTokens,
+        onProviderTokens,
+      );
+
+      if (result.midStreamFailover) {
+        accumulatedPartial += result.streamedText;
+      }
 
       if (result.succeeded) {
         releaseRequest(provider.name, true);
@@ -76,10 +96,8 @@ export function createResilientStream(
 
       releaseRequest(provider.name, false);
 
-      if (!result.midStreamFailover || i >= providers.length - 1) break;
+      if (!result.midStreamFailover || !nextProvider) break;
     }
-
-    activeAttempt = null;
 
     if (!succeeded) {
       const errEvent: AnyRoutingEvent = { type: 'error', message: 'All providers exhausted' };
@@ -96,6 +114,7 @@ export function createResilientStream(
 interface DrainResult {
   succeeded: boolean;
   midStreamFailover: boolean;
+  streamedText: string;
 }
 
 async function drainStream(
@@ -104,11 +123,17 @@ async function drainStream(
   currentProvider: ProviderName,
   nextProvider: ProviderName | undefined,
   onEvent: (event: AnyRoutingEvent) => void,
+  inputTokens: number,
+  onProviderTokens?: (provider: ProviderName, outputTokens: number) => void,
 ): Promise<DrainResult> {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let lineBuffer = '';
   let tokensStreamed = 0;
+  let accumulatedText = '';
+  let tpmExhausted = false;
+
+  const maxOutputTokens = Math.max(0, getRemainingTpm(currentProvider) - inputTokens);
 
   try {
     const reader = stream.getReader();
@@ -132,15 +157,40 @@ async function drainStream(
           const parsed = JSON.parse(json);
           if (parsed?.type === 'token' && typeof parsed.content === 'string') {
             tokensStreamed++;
+            accumulatedText += parsed.content;
+
+            if (nextProvider && tokensStreamed >= maxOutputTokens) {
+              tpmExhausted = true;
+              reader.cancel().catch(() => undefined);
+              break;
+            }
           }
         } catch { /* skip */ }
       }
+
+      if (tpmExhausted) break;
     }
 
-    return { succeeded: true, midStreamFailover: false };
+    onProviderTokens?.(currentProvider, tokensStreamed);
+
+    if (tpmExhausted && nextProvider) {
+      const failoverEvent: AnyRoutingEvent = {
+        type: 'mid_stream_failover',
+        from: currentProvider,
+        to: nextProvider,
+        tokensStreamedBeforeFailure: tokensStreamed,
+      };
+      onEvent(failoverEvent);
+      await safeWrite(writer, encoder.encode(`data: ${JSON.stringify(failoverEvent)}\n\n`));
+      return { succeeded: false, midStreamFailover: true, streamedText: accumulatedText };
+    }
+
+    return { succeeded: true, midStreamFailover: false, streamedText: accumulatedText };
   } catch {
+    onProviderTokens?.(currentProvider, tokensStreamed);
+
     if (!nextProvider) {
-      return { succeeded: false, midStreamFailover: false };
+      return { succeeded: false, midStreamFailover: false, streamedText: accumulatedText };
     }
 
     const failoverEvent: AnyRoutingEvent = {
@@ -152,7 +202,7 @@ async function drainStream(
     onEvent(failoverEvent);
     await safeWrite(writer, encoder.encode(`data: ${JSON.stringify(failoverEvent)}\n\n`));
 
-    return { succeeded: false, midStreamFailover: true };
+    return { succeeded: false, midStreamFailover: true, streamedText: accumulatedText };
   }
 }
 

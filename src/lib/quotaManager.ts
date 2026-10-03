@@ -68,16 +68,15 @@ export function isProviderAvailable(provider: ProviderName): boolean {
   return state.cooldownUntil === null;
 }
 
-export function hasCapacityFor(provider: ProviderName, estimatedTokens: number): boolean {
+export function getRemainingTpm(provider: ProviderName): number {
   const state = getState().get(provider);
-  if (!state) return false;
-  const maxTpm = getMaxTpm(provider);
-  if (state.tokensUsedThisMinute + estimatedTokens > maxTpm) {
-    state.cooldownUntil = state.lastMinuteReset + 60_000;
-    persistSnapshot(provider, state);
-    return false;
-  }
-  return true;
+  if (!state) return 0;
+  return Math.max(0, getMaxTpm(provider) - state.tokensUsedThisMinute);
+}
+
+export function hasCapacityFor(provider: ProviderName, estimatedTokens: number): boolean {
+  if (!isProviderAvailable(provider)) return false;
+  return getRemainingTpm(provider) >= estimatedTokens;
 }
 
 export function recordRateLimit(provider: ProviderName, retryAfterSeconds: number): void {
