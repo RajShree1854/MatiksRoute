@@ -20,7 +20,7 @@ export class GroqProvider implements AIProvider {
     return isProviderAvailable('groq');
   }
 
-  async streamChat(messages: ChatMessage[]): Promise<ReadableStream<Uint8Array>> {
+  async streamChat(messages: ChatMessage[], signal?: AbortSignal): Promise<ReadableStream<Uint8Array>> {
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -28,7 +28,7 @@ export class GroqProvider implements AIProvider {
         Authorization: `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({ model: this.model, messages, stream: true, max_tokens: 8192 }),
-      signal: AbortSignal.timeout(30_000),
+      signal: signal ?? AbortSignal.timeout(30_000),
     });
 
     if (!response.ok) {

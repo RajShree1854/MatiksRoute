@@ -1,5 +1,6 @@
 import { ProviderName, QuotaStatus } from '@/providers/types';
 import { upsertQuotaSnapshot } from '@/lib/db';
+import { getHeadroom } from '@/lib/admissionController';
 
 interface ProviderQuotaState {
   cooldownUntil: number | null;
@@ -32,7 +33,12 @@ declare global {
 function initState(): Map<ProviderName, ProviderQuotaState> {
   const map = new Map<ProviderName, ProviderQuotaState>();
   for (const p of PROVIDERS) {
-    map.set(p, { cooldownUntil: null, tokensUsedThisMinute: 0, lastMinuteReset: Date.now(), totalRequests: 0 });
+    map.set(p, {
+      cooldownUntil: null,
+      tokensUsedThisMinute: 0,
+      lastMinuteReset: Date.now(),
+      totalRequests: 0,
+    });
   }
   return map;
 }
@@ -53,29 +59,20 @@ function getState(): Map<ProviderName, ProviderQuotaState> {
   return global.__quotaState;
 }
 
-/** Returns true only if the provider is not in cooldown. */
 export function isProviderAvailable(provider: ProviderName): boolean {
   const state = getState().get(provider);
   if (!state) return false;
-  // Clear expired cooldown
   if (state.cooldownUntil !== null && Date.now() >= state.cooldownUntil) {
     state.cooldownUntil = null;
   }
   return state.cooldownUntil === null;
 }
 
-/**
- * Pre-flight check: returns true only if the provider has enough remaining
- * TPM budget to handle a request of `estimatedTokens` tokens.
- * If the budget would be exceeded, the provider is placed in cooldown immediately
- * so it is skipped cleanly and other providers are tried.
- */
 export function hasCapacityFor(provider: ProviderName, estimatedTokens: number): boolean {
   const state = getState().get(provider);
   if (!state) return false;
   const maxTpm = getMaxTpm(provider);
   if (state.tokensUsedThisMinute + estimatedTokens > maxTpm) {
-    // Put provider in cooldown until the current minute window resets
     state.cooldownUntil = state.lastMinuteReset + 60_000;
     persistSnapshot(provider, state);
     return false;
@@ -90,20 +87,19 @@ export function recordRateLimit(provider: ProviderName, retryAfterSeconds: numbe
   persistSnapshot(provider, state);
 }
 
-/**
- * Record actual token consumption against the provider that SERVED the request.
- * Must be called with the real succeeded provider, not the originally targeted one.
- */
 export function recordUsage(provider: ProviderName, tokens: number): void {
   const state = getState().get(provider);
   if (!state) return;
   state.tokensUsedThisMinute += tokens;
   state.totalRequests += 1;
-  // If recording this usage now exceeds the budget, schedule a cooldown
   if (state.tokensUsedThisMinute >= getMaxTpm(provider)) {
     state.cooldownUntil = state.lastMinuteReset + 60_000;
   }
   persistSnapshot(provider, state);
+}
+
+export function selectByHeadroom(providers: ProviderName[]): ProviderName[] {
+  return [...providers].sort((a, b) => getHeadroom(b) - getHeadroom(a));
 }
 
 export function getAllQuotaStatuses(): QuotaStatus[] {
@@ -113,7 +109,6 @@ export function getAllQuotaStatuses(): QuotaStatus[] {
       tokensUsedThisMinute: 0,
       totalRequests: 0,
     };
-    // Clear expired cooldown before reporting
     if (state.cooldownUntil !== null && Date.now() >= state.cooldownUntil) {
       state.cooldownUntil = null;
     }

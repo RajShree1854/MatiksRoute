@@ -1,26 +1,23 @@
 import { AIProvider, AnyRoutingEvent, ChatMessage, ProviderName } from '@/providers/types';
+import { admitRequest, releaseRequest } from '@/lib/admissionController';
 
 export interface RelayOptions {
-  /** Called when a routing event occurs (fallback, mid-stream failover, etc.) */
   onEvent: (event: AnyRoutingEvent) => void;
+  failoverBeforeRetry?: boolean;
 }
 
-/**
- * Creates a resilient SSE stream that tries each provider in order.
- *
- * - Pre-stream failures (network error, 4xx): silently fall back to next provider.
- * - Mid-stream failures (connection drop during streaming): inject a failover event,
- *   resume from the next provider with context of what was already sent.
- *
- * All provider streams must emit normalized SSE: `data: {"type":"token","content":"..."}\n\n`
- */
+interface StreamAttempt {
+  provider: AIProvider;
+  abortController: AbortController;
+}
+
 export function createResilientStream(
   providers: AIProvider[],
   messages: ChatMessage[],
   options: RelayOptions,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
-  const { onEvent } = options;
+  const { onEvent, failoverBeforeRetry = true } = options;
 
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
@@ -28,110 +25,65 @@ export function createResilientStream(
   (async () => {
     const attempted: ProviderName[] = [];
     let succeeded = false;
-    let currentMessages = messages;
+    let activeAttempt: StreamAttempt | null = null;
 
     for (let i = 0; i < providers.length; i++) {
       const provider = providers[i];
       attempted.push(provider.name);
 
-      if (i > 0) {
-        // Emit a fallback event before trying the next provider
-        const prevProvider = providers[i - 1].name;
-        const eventPayload: AnyRoutingEvent = {
+      const admitted = admitRequest(provider.name);
+      if (!admitted && failoverBeforeRetry && i < providers.length - 1) {
+        emitEvent(writer, encoder, onEvent, {
           type: 'fallback',
-          from: prevProvider,
+          from: provider.name,
+          to: providers[i + 1].name,
+          reason: 'admission_rejected',
+        });
+        continue;
+      }
+
+      if (i > 0) {
+        emitEvent(writer, encoder, onEvent, {
+          type: 'fallback',
+          from: providers[i - 1].name,
           to: provider.name,
           reason: 'provider_error',
-        };
-        onEvent(eventPayload);
-        await safeWrite(
-          writer,
-          encoder.encode(`data: ${JSON.stringify(eventPayload)}\n\n`),
-        );
+        });
       }
+
+      const abortController = new AbortController();
+      activeAttempt = { provider, abortController };
 
       let stream: ReadableStream<Uint8Array>;
       try {
-        stream = await provider.streamChat(currentMessages);
+        stream = await provider.streamChat(messages, abortController.signal);
       } catch (err) {
+        releaseRequest(provider.name, false);
         const reason = err instanceof Error ? err.message : String(err);
         onEvent({ type: 'error', message: `${provider.name}: ${reason}` });
-        continue; // Try next provider
+
+        if (failoverBeforeRetry && i < providers.length - 1) continue;
+        break;
       }
 
-      // Attempt to read the stream; handle mid-stream failures
-      const bufferedTokens: string[] = [];
-      let midStreamFailed = false;
+      const result = await drainStream(stream, writer, provider.name, providers[i + 1]?.name, onEvent);
 
-      try {
-        const reader = stream.getReader();
-        const lineDecoder = new TextDecoder();
-        let lineBuffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          // Forward raw bytes to client
-          await safeWrite(writer, value);
-
-          // Also buffer decoded tokens for mid-stream resume context
-          lineBuffer += lineDecoder.decode(value, { stream: true });
-          const lines = lineBuffer.split('\n');
-          lineBuffer = lines.pop() ?? '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const json = trimmed.slice(5).trim();
-            if (!json || json === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(json);
-              if (parsed?.type === 'token' && typeof parsed.content === 'string') {
-                bufferedTokens.push(parsed.content);
-              }
-            } catch { /* skip */ }
-          }
-        }
-
+      if (result.succeeded) {
+        releaseRequest(provider.name, true);
         succeeded = true;
-        break; // Stream completed cleanly
-      } catch {
-        // Mid-stream failure
-        midStreamFailed = true;
-        const nextProvider = providers[i + 1];
-        if (!nextProvider) break; // No more providers
-
-        const failoverEvent: AnyRoutingEvent = {
-          type: 'mid_stream_failover',
-          from: provider.name,
-          to: nextProvider.name,
-          tokensStreamedBeforeFailure: bufferedTokens.length,
-        };
-        onEvent(failoverEvent);
-        await safeWrite(
-          writer,
-          encoder.encode(`data: ${JSON.stringify(failoverEvent)}\n\n`),
-        );
-
-        // Inject the partial response as context for the next provider
-        const partialContent = bufferedTokens.join('');
-        if (partialContent) {
-          currentMessages = [
-            ...currentMessages,
-            { role: 'assistant', content: `[Partial response, continue from here:] ${partialContent}` },
-          ];
-        }
+        break;
       }
 
-      if (!midStreamFailed) break;
+      releaseRequest(provider.name, false);
+
+      if (!result.midStreamFailover || i >= providers.length - 1) break;
     }
 
+    activeAttempt = null;
+
     if (!succeeded) {
-      const errEvent: AnyRoutingEvent = { type: 'error', message: 'All providers failed' };
-      await safeWrite(
-        writer,
-        encoder.encode(`data: ${JSON.stringify(errEvent)}\n\n`),
-      );
+      const errEvent: AnyRoutingEvent = { type: 'error', message: 'All providers exhausted' };
+      await safeWrite(writer, encoder.encode(`data: ${JSON.stringify(errEvent)}\n\n`));
     }
 
     await safeWrite(writer, encoder.encode('data: [DONE]\n\n'));
@@ -141,6 +93,79 @@ export function createResilientStream(
   return readable;
 }
 
+interface DrainResult {
+  succeeded: boolean;
+  midStreamFailover: boolean;
+}
+
+async function drainStream(
+  stream: ReadableStream<Uint8Array>,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  currentProvider: ProviderName,
+  nextProvider: ProviderName | undefined,
+  onEvent: (event: AnyRoutingEvent) => void,
+): Promise<DrainResult> {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let lineBuffer = '';
+  let tokensStreamed = 0;
+
+  try {
+    const reader = stream.getReader();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      await safeWrite(writer, value);
+
+      lineBuffer += decoder.decode(value, { stream: true });
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const json = trimmed.slice(5).trim();
+        if (!json || json === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(json);
+          if (parsed?.type === 'token' && typeof parsed.content === 'string') {
+            tokensStreamed++;
+          }
+        } catch { /* skip */ }
+      }
+    }
+
+    return { succeeded: true, midStreamFailover: false };
+  } catch {
+    if (!nextProvider) {
+      return { succeeded: false, midStreamFailover: false };
+    }
+
+    const failoverEvent: AnyRoutingEvent = {
+      type: 'mid_stream_failover',
+      from: currentProvider,
+      to: nextProvider,
+      tokensStreamedBeforeFailure: tokensStreamed,
+    };
+    onEvent(failoverEvent);
+    await safeWrite(writer, encoder.encode(`data: ${JSON.stringify(failoverEvent)}\n\n`));
+
+    return { succeeded: false, midStreamFailover: true };
+  }
+}
+
+function emitEvent(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  encoder: TextEncoder,
+  onEvent: (event: AnyRoutingEvent) => void,
+  event: AnyRoutingEvent,
+): void {
+  onEvent(event);
+  safeWrite(writer, encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+}
+
 async function safeWrite(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   chunk: Uint8Array,
@@ -148,6 +173,6 @@ async function safeWrite(
   try {
     await writer.write(chunk);
   } catch {
-    // Client disconnected; ignore
+    // Client disconnected
   }
 }
