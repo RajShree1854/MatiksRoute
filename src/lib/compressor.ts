@@ -1,68 +1,108 @@
 import { ChatMessage } from '@/providers/types';
-import { countMessagesTokens } from '@/lib/tokenizer';
+import { countMessagesTokens, countTokens } from '@/lib/tokenizer';
 
-const MAX_HISTORY_MESSAGES = 12;
+export type CompressionMode = 'off' | 'lite' | 'auto';
 
-interface CompressResult {
+export interface CompressionConfig {
+  mode: CompressionMode;
+  maxHistoryMessages?: number;
+}
+
+export interface CompressResult {
   messages: ChatMessage[];
   originalTokens: number;
   compressedTokens: number;
+  mode: CompressionMode;
 }
 
-export function compressMessages(messages: ChatMessage[]): CompressResult {
+const DEFAULT_MAX_HISTORY = 12;
+const AUTO_TRIGGER_THRESHOLD = 2_000;
+
+export function compressMessages(
+  messages: ChatMessage[],
+  config: CompressionConfig = { mode: 'auto' },
+): CompressResult {
   const originalTokens = countMessagesTokens(messages);
+  const effectiveMode = resolveMode(config, originalTokens);
 
-  let compressed = deduplicateSystemPrompts(messages);
-  compressed = normalizeWhitespace(compressed);
-  compressed = truncateOldHistory(compressed);
+  if (effectiveMode === 'off') {
+    return { messages, originalTokens, compressedTokens: originalTokens, mode: 'off' };
+  }
 
-  const compressedTokens = countMessagesTokens(compressed);
+  const maxHistory = config.maxHistoryMessages ?? DEFAULT_MAX_HISTORY;
+  let result = deduplicateSystemPrompts(messages);
+  result = normalizeWhitespace(result);
+  result = collapseHistory(result, maxHistory);
 
-  return { messages: compressed, originalTokens, compressedTokens };
+  const compressedTokens = countMessagesTokens(result);
+
+  return { messages: result, originalTokens, compressedTokens, mode: effectiveMode };
 }
 
-/** Removes duplicate consecutive system prompts, keeping only the last one. */
+function resolveMode(config: CompressionConfig, tokenCount: number): CompressionMode {
+  if (config.mode === 'off') return 'off';
+  if (config.mode === 'lite') return 'lite';
+  return tokenCount >= AUTO_TRIGGER_THRESHOLD ? 'lite' : 'off';
+}
+
 function deduplicateSystemPrompts(messages: ChatMessage[]): ChatMessage[] {
   const systemMessages = messages.filter((m) => m.role === 'system');
   if (systemMessages.length <= 1) return messages;
 
-  const lastSystem = systemMessages.at(-1)!;
-  return [lastSystem, ...messages.filter((m) => m.role !== 'system')];
+  const merged = systemMessages
+    .map((m) => (typeof m.content === 'string' ? m.content : extractText(m.content)))
+    .join('\n');
+
+  const mergedSystem: ChatMessage = { role: 'system', content: merged };
+  return [mergedSystem, ...messages.filter((m) => m.role !== 'system')];
 }
 
-/** Strips excessive whitespace from text content in every message. */
 function normalizeWhitespace(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((msg) => {
     if (typeof msg.content !== 'string') return msg;
-    const normalized = msg.content.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+
+    const normalized = msg.content
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[^\S\n]{2,}/g, ' ')
+      .trim();
+
     return normalized === msg.content ? msg : { ...msg, content: normalized };
   });
 }
 
-/**
- * If there are more than MAX_HISTORY_MESSAGES non-system messages,
- * collapses the oldest ones into a single summary message.
- */
-function truncateOldHistory(messages: ChatMessage[]): ChatMessage[] {
+function collapseHistory(messages: ChatMessage[], maxHistory: number): ChatMessage[] {
   const systemMessages = messages.filter((m) => m.role === 'system');
   const conversation = messages.filter((m) => m.role !== 'system');
 
-  if (conversation.length <= MAX_HISTORY_MESSAGES) return messages;
+  if (conversation.length <= maxHistory) return messages;
 
-  const excess = conversation.slice(0, conversation.length - MAX_HISTORY_MESSAGES);
-  const kept = conversation.slice(conversation.length - MAX_HISTORY_MESSAGES);
+  const excess = conversation.slice(0, conversation.length - maxHistory);
+  const kept = conversation.slice(conversation.length - maxHistory);
 
-  const summaryText = excess
-    .map((m) => {
-      const text = typeof m.content === 'string' ? m.content : '[media content]';
-      return `${m.role}: ${text.slice(0, 80)}${text.length > 80 ? '…' : ''}`;
-    })
-    .join(' | ');
+  const totalExcessTokens = excess.reduce((acc, m) => {
+    const text = typeof m.content === 'string' ? m.content : extractText(m.content);
+    return acc + countTokens(text);
+  }, 0);
+
+  const summaryParts = excess.map((m) => {
+    const text = typeof m.content === 'string' ? m.content : '[media]';
+    const preview = text.length > 100 ? `${text.slice(0, 100)}…` : text;
+    return `${m.role}: ${preview}`;
+  });
 
   const summaryMessage: ChatMessage = {
     role: 'user',
-    content: `[Earlier conversation summary: ${summaryText}]`,
+    content: `[Earlier context (${totalExcessTokens} tokens summarized): ${summaryParts.join(' | ')}]`,
   };
 
   return [...systemMessages, summaryMessage, ...kept];
+}
+
+function extractText(content: ChatMessage['content']): string {
+  if (typeof content === 'string') return content;
+  return content
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .map((p) => p.text)
+    .join('');
 }

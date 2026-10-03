@@ -31,6 +31,8 @@ export interface MetaEvent extends RoutingEvent {
   imageAction: ImageAction;
   originalTokens: number;
   compressedTokens: number;
+  compressionMode: string;
+  failoverBeforeRetry: boolean;
 }
 
 
@@ -79,7 +81,7 @@ export interface AIProvider {
   readonly name: ProviderName;
   readonly supportsVision: boolean;
   isAvailable(): boolean;
-  streamChat(messages: ChatMessage[]): Promise<ReadableStream<Uint8Array>>;
+  streamChat(messages: ChatMessage[], signal?: AbortSignal): Promise<ReadableStream<Uint8Array>>;
 }
 
 export interface QuotaStatus {

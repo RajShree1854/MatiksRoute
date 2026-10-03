@@ -1,6 +1,6 @@
-# MatiksRoute 
+# MatiksRoute
 
-An intelligent, production-grade AI Gateway that routes chat requests across multiple LLM providers (OpenAI, Gemini, Groq) using smart complexity classification, circuit-breaking, quota management, and real-time observability — all streamed via Server-Sent Events.
+An intelligent, production-grade AI Gateway that routes chat requests across multiple LLM providers (OpenAI, Gemini, Groq) using smart complexity classification, adaptive concurrency control, multi-strategy compression, headroom-aware combo routing, and real-time observability — all streamed via Server-Sent Events.
 
 ---
 
@@ -12,14 +12,14 @@ Every chat message goes through an 8-stage pipeline before reaching an AI model:
 User Message
     │
     ▼
-1. Compress  ──► Strip whitespace, trim chat history to token budget
+1. Compress  ──► Multi-strategy (off / lite / auto) prompt compression
     │
     ▼
 2. Classify  ──► Skip (FORCED_PRIORITY) OR classify as simple / medium / hard
-    │
+    │            → buildRoutingStrategy() returns tier + chain + FOBR flag
     ▼
 3. Pre-flight ──► Filter providers by: not in cooldown AND under TPM budget
-    │
+    │            → selectByHeadroom() sorts survivors by least-saturated first
     ▼
 4. Trim      ──► Trim context to provider's max context window (32k / 128k / 1M)
     │
@@ -27,8 +27,8 @@ User Message
 5. Modality  ──► Strip or resize images based on provider vision support
     │
     ▼
-6. Stream    ──► Try each provider in chain; mid-stream failover on disconnect
-    │
+6. Stream    ──► Try each provider in chain; AbortSignal-based mid-stream failover
+    │            → Failover Before Retry (FOBR) for instant sibling switching
     ▼
 7. Telemetry ──► Record tokens, latency, errors async to SQLite (non-blocking)
     │
@@ -40,54 +40,73 @@ SSE Stream to Client
 
 ## Features
 
-### 1. Smart Complexity Classifier
-Analyzes token count, keyword signals, and conversation history length to classify each request as `simple`, `medium`, or `hard`. Each tier routes to a different primary provider.
+### 1. Combo Routing with Failover-Before-Retry (FOBR)
+A unified `buildRoutingStrategy()` function handles both smart and forced-priority routing modes in a single call, returning the complexity tier, the provider chain, and the `failoverBeforeRetry` flag.
+
+When `FAILOVER_BEFORE_RETRY=true` (default), a single upstream error immediately skips to the next sibling provider in the chain **without waiting for any retry delay** — eliminating the latency cost of retry-then-fallback loops.
 
 - `simple` → Groq (Llama 3, fastest, free)
 - `medium` → Gemini (balanced cost/quality)
 - `hard` → OpenAI (GPT-4o, most capable)
 
-Disable with `FORCED_PRIORITY=true` to use a fixed priority order instead.
+Disable smart routing with `FORCED_PRIORITY=true` to use a fixed `PRIORITY_ORDER` chain instead.
 
-### 2. Circuit Breaker (Proactive Cooldown)
-When a provider returns a `429 Too Many Requests` or quota error, the gateway parses the `Retry-After` header and places that provider in a **hard cooldown penalty box**. Future requests instantly skip the broken provider without making any network calls, eliminating wasted latency.
+### 2. Adaptive Admission Controller
+Each provider now tracks in-flight request concurrency independently via `admissionController.ts`. A 10-second sliding window measures rejection and completion rates and **automatically scales the per-provider concurrency limit up or down**:
 
-### 3. Multi-Tier Fallback & Mid-Stream Failover
-The provider chain is tried in sequence. If a provider fails:
-- **Pre-stream failure** (network error, 4xx before any tokens): silently skip to the next provider.
-- **Mid-stream failure** (connection dropped during streaming): the partial response is injected back into context, the next provider is invoked to continue the sentence, and the client never sees a gap.
+- Rejection rate > 25% → scale down limit by 25%
+- Rejection rate < 5% with high saturation → scale up limit by 25%
 
-### 4. Sliding-Window TPM Quota Management
-Each provider has a configurable `MAX_TPM` (Tokens Per Minute) budget enforced on a rolling 60-second window. Before routing any request, a **pre-flight capacity check** estimates the token cost (`input x 3`). If a provider would exceed its budget, it is immediately skipped and put in cooldown — preventing overspending before any API call is made.
+When `failoverBeforeRetry` is enabled and a provider's concurrency limit is full at dispatch time, the request is **instantly redirected** to the next provider without a network round-trip — no waiting, no timeout, no wasted latency.
 
-### 5. Multi-Modal Content Bridge (powered by `sharp`)
+### 3. Headroom-Aware Provider Selection
+After filtering by TPM budget and cooldown status, surviving providers are sorted by `getHeadroom()` — the fraction of their concurrency limit that is currently free. The least-saturated provider is always dispatched first, distributing load intelligently instead of always hammering the first provider in the chain.
+
+### 4. Multi-Strategy Prompt Compression
+Three compression modes controlled by `COMPRESSION_MODE` env var:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` | No compression. Passes messages through unchanged. |
+| `lite` | Always compresses: merges system prompts, normalizes whitespace, collapses old history into a summarized message with token count. |
+| `auto` | Compression triggers only when the request exceeds **2,000 tokens**. Prevents unnecessary processing on short prompts. |
+
+Average token savings: 2–12% depending on history length and prompt verbosity.
+
+### 5. AbortSignal-Based Mid-Stream Failover
+When a provider's stream fails mid-response, a dedicated `AbortController` per-attempt cleanly cancels the abandoned upstream connection instead of letting it hang until the 30-second timeout. The relay:
+
+1. Records the count of tokens already streamed before the failure
+2. Emits a `mid_stream_failover` SSE event so the client knows a handoff occurred
+3. Immediately initializes a fresh stream from the next sibling provider
+
+No partial response is injected into the next provider's context (which caused response duplication artifacts in the prior implementation). The sibling model generates a complete fresh response.
+
+### 6. Circuit Breaker (Proactive Cooldown)
+When a provider returns `429 Too Many Requests`, the gateway parses the `Retry-After` header and places the provider in a hard cooldown. Future requests instantly skip the broken provider with zero network calls, eliminating wasted latency.
+
+### 7. Multi-Modal Content Bridge (powered by `sharp`)
 Automatically handles vision content based on the routed provider's capabilities:
 - Provider **supports vision** → `passed` (forwarded as-is)
-- Provider **supports vision** but image is very large → `resized` (downscaled to 512x512 to save vision tokens)
-- Provider **does not support vision** → `stripped` (image removed, text-only request sent to prevent a 400 crash)
+- Provider **supports vision** but image is very large → `resized` (downscaled to 512×512)
+- Provider **does not support vision** → `stripped` (image removed, text-only request sent)
 
-### 6. Prompt Compression
-Before any request is sent, the gateway:
-1. Aggressively minifies repeated whitespace and characters in the prompt.
-2. Trims the full chat history using `tiktoken` to fit within the provider's context window.
-
-Average token savings: 2-6%.
-
-### 7. Universal SSE Adapter Pattern
-OpenAI, Gemini, and Groq each have completely different streaming response formats. Three custom adapters normalize them all into a single unified SSE format:
+### 8. Universal SSE Adapter Pattern
+OpenAI, Gemini, and Groq each have different streaming response formats. Three custom adapters normalize them all into a single unified SSE format:
 
 ```
+data: {"type":"meta","tier":"simple","provider":"groq","compressionMode":"auto","failoverBeforeRetry":true}
 data: {"type":"token","content":"..."}
-data: {"type":"fallback","from":"gemini","to":"openai","reason":"provider_error"}
-data: {"type":"done","provider":"openai","latencyMs":1234,"tokensUsed":512}
+data: {"type":"fallback","from":"groq","to":"openai","reason":"provider_error"}
+data: {"type":"mid_stream_failover","from":"openai","to":"gemini","tokensStreamedBeforeFailure":42}
+data: {"type":"done","provider":"openai","latencyMs":1234,"tokensUsed":512,"fallbackCount":1}
+data: [DONE]
 ```
 
-The frontend only consumes one interface regardless of which AI is running.
+### 9. Asynchronous Telemetry & Observability
+Every request writes a structured log to a local SQLite database (WAL mode). The write is detached from the request lifecycle using `Promise.resolve()`, ensuring disk I/O **never blocks the streaming response**.
 
-### 8. Asynchronous Telemetry & Observability
-Every request writes a structured log to a local SQLite database (WAL mode). The write is detached from the request lifecycle using `Promise.resolve()`, meaning disk I/O **never blocks the streaming response**.
-
-Logs include: timestamp, complexity tier, provider attempted, provider succeeded, fallback count, mid-stream failover flag, image action, token counts, tokens saved %, latency, and full error strings from provider APIs.
+Logs include: timestamp, complexity tier, provider attempted, provider succeeded, fallback count, mid-stream failover flag, compression mode, image action, token counts, tokens saved %, latency, and full error strings from provider APIs.
 
 ---
 
@@ -112,28 +131,29 @@ Logs include: timestamp, complexity tier, provider attempted, provider succeeded
 src/
 ├── app/
 │   ├── api/
-│   │   ├── chat/route.ts       # Main SSE streaming endpoint (POST /api/chat)
-│   │   ├── logs/route.ts       # Telemetry log viewer (GET /api/logs)
-│   │   └── quota/route.ts      # Live provider quota status (GET /api/quota)
-│   ├── dashboard/page.tsx      # Real-time observability dashboard
-│   └── layout.tsx              # Root layout
+│   │   ├── chat/route.ts            # Main SSE streaming endpoint (POST /api/chat)
+│   │   ├── logs/route.ts            # Telemetry log viewer (GET /api/logs)
+│   │   └── quota/route.ts           # Live provider quota status (GET /api/quota)
+│   ├── dashboard/page.tsx           # Real-time observability dashboard
+│   └── layout.tsx                   # Root layout
 ├── components/
-│   ├── ChatPanel.tsx           # Chat UI + SSE event consumer
-│   └── RouterLogs.tsx          # Router activity feed + provider health cards
+│   ├── ChatPanel.tsx                # Chat UI + SSE event consumer
+│   └── RouterLogs.tsx               # Router activity feed + provider health cards
 ├── lib/
-│   ├── orchestrator.ts         # Main routing pipeline (the core)
-│   ├── classifier.ts           # Complexity classifier + forced priority chain
-│   ├── compressor.ts           # Prompt compression pipeline
-│   ├── db.ts                   # SQLite connection + log queries (WAL mode)
-│   ├── modalityBridge.ts       # Image pass/resize/strip logic
-│   ├── quotaManager.ts         # Sliding-window TPM + circuit breaker state
-│   ├── streamRelay.ts          # Resilient multi-provider SSE relay
-│   └── tokenizer.ts            # Tiktoken token counting + context trimming
+│   ├── orchestrator.ts              # Main routing pipeline (the core)
+│   ├── classifier.ts                # buildRoutingStrategy() — unified tier + FOBR
+│   ├── compressor.ts                # Multi-strategy compression (off/lite/auto)
+│   ├── admissionController.ts       # Per-provider adaptive concurrency + headroom
+│   ├── db.ts                        # SQLite connection + log queries (WAL mode)
+│   ├── modalityBridge.ts            # Image pass/resize/strip logic
+│   ├── quotaManager.ts              # Sliding-window TPM + circuit breaker + headroom sort
+│   ├── streamRelay.ts               # Resilient multi-provider SSE relay (FOBR + AbortSignal)
+│   └── tokenizer.ts                 # Tiktoken token counting + context trimming
 └── providers/
-    ├── openai.ts               # OpenAI SSE adapter
-    ├── gemini.ts               # Gemini SSE adapter
-    ├── groq.ts                 # Groq SSE adapter
-    └── types.ts                # Shared types (RoutingEvent, RequestLog, etc.)
+    ├── openai.ts                    # OpenAI SSE adapter (AbortSignal-aware)
+    ├── gemini.ts                    # Gemini SSE adapter (AbortSignal-aware)
+    ├── groq.ts                      # Groq SSE adapter (AbortSignal-aware)
+    └── types.ts                     # Shared types (RoutingEvent, RequestLog, etc.)
 ```
 
 ---
@@ -180,8 +200,6 @@ Open [http://localhost:3000/dashboard](http://localhost:3000/dashboard) for the 
 
 ## Environment Variables
 
-Copy `.env.local.example` to `.env.local` and fill in your values.
-
 ```env
 # API Keys (required)
 OPENAI_API_KEY=sk-...
@@ -199,7 +217,6 @@ TIER_MEDIUM=gemini
 TIER_SIMPLE=groq
 
 # Per-Provider Token-Per-Minute Budget
-# Set GROQ_MAX_TPM to a small value (e.g. 200) to demo quota fallback live
 OPENAI_MAX_TPM=200000
 GEMINI_MAX_TPM=1000000
 GROQ_MAX_TPM=30000
@@ -209,6 +226,17 @@ GROQ_MAX_TPM=30000
 # FORCED_PRIORITY=false - use hard/medium/simple smart classifier
 FORCED_PRIORITY=true
 PRIORITY_ORDER=openai,gemini,groq
+
+# Failover Strategy
+# FAILOVER_BEFORE_RETRY=true  - skip immediately to next provider on any error (default)
+# FAILOVER_BEFORE_RETRY=false - retry the same provider once before falling over
+FAILOVER_BEFORE_RETRY=true
+
+# Compression Mode
+# off  - disabled, pass messages through unchanged
+# lite - always compress (whitespace + history collapse)
+# auto - compress only when request exceeds 2,000 tokens (default)
+COMPRESSION_MODE=auto
 ```
 
 ---
@@ -229,7 +257,7 @@ Main chat endpoint. Accepts a JSON body and streams back SSE events.
 
 **Stream Events:**
 ```
-data: {"type":"meta","tier":"simple","provider":"groq","hadImages":false}
+data: {"type":"meta","tier":"simple","provider":"groq","compressionMode":"off","failoverBeforeRetry":true,"hadImages":false}
 data: {"type":"token","content":"Hi"}
 data: {"type":"token","content":", how can I help?"}
 data: {"type":"fallback","from":"groq","to":"openai","reason":"provider_error"}
@@ -238,7 +266,7 @@ data: [DONE]
 ```
 
 ### `GET /api/logs?limit=50`
-Returns the last N routing events from the SQLite database with clean JSON. Null and default fields are omitted automatically.
+Returns the last N routing events from the SQLite database as clean JSON.
 
 ### `GET /api/quota`
 Returns the live quota status of all three providers: TPM used, cooldown timer, and total requests.
@@ -247,8 +275,8 @@ Returns the live quota status of all three providers: TPM used, cooldown timer, 
 
 ## Known Limitations
 
-- **TPM estimation is approximate**: The pre-flight check estimates token cost as `inputTokens x 3`. Real output token counts are measured from the stream after the fact. If a response is unusually long, a provider could marginally exceed its budget before the next request.
-- **In-memory quota state**: Quota state lives in Node.js `global`. It resets on server restart. For multi-instance production deployments, replace with a distributed store like Redis.
+- **TPM estimation is approximate**: The pre-flight check estimates token cost as `inputTokens × 3`. Real output token counts are measured from the stream after the fact. If a response is unusually long, a provider could marginally exceed its budget before the next request.
+- **In-memory admission state**: Concurrency limits and quota state live in Node.js `global`. They reset on server restart. For multi-instance production deployments, replace with a distributed store like Redis.
 - **Image resizing is best-effort**: If `sharp` fails to process an image, the gateway degrades gracefully by stripping the image rather than crashing.
 - **Groq does not support vision natively**: Images sent to Groq are automatically stripped by the modality bridge.
-- **Free-tier Gemini has a hard daily limit**: On the free tier, Gemini allows around 20 requests/day. The circuit breaker will catch the `429` and reroute to the next provider automatically.
+- **Mid-stream failover generates a fresh response**: The sibling provider restarts generation from scratch. Tokens already streamed to the client before the failover remain visible, but the continuation is a new response rather than a resumed sentence.

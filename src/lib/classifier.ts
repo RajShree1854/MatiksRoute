@@ -1,6 +1,12 @@
 import { ChatMessage, ComplexityTier, ProviderName } from '@/providers/types';
 import { countMessagesTokens } from '@/lib/tokenizer';
 
+export interface RoutingStrategy {
+  tier: ComplexityTier;
+  chain: ProviderName[];
+  failoverBeforeRetry: boolean;
+}
+
 const HARD_KEYWORDS = new Set([
   'algorithm', 'architect', 'refactor', 'optimize', 'compiler', 'theorem',
   'prove', 'system design', 'distributed', 'concurrent', 'parallel', 'scalab',
@@ -15,6 +21,19 @@ const MEDIUM_KEYWORDS = new Set([
 ]);
 
 const TIER_TOKEN_THRESHOLDS = { hard: 500, medium: 100 };
+const ALL_PROVIDERS: ProviderName[] = ['openai', 'gemini', 'groq'];
+
+const TIER_PRIMARY: Record<ComplexityTier, ProviderName> = {
+  hard:   (process.env.TIER_HARD   as ProviderName) ?? 'openai',
+  medium: (process.env.TIER_MEDIUM as ProviderName) ?? 'gemini',
+  simple: (process.env.TIER_SIMPLE as ProviderName) ?? 'groq',
+};
+
+export const isForcedPriority: boolean =
+  (process.env.FORCED_PRIORITY ?? 'true').toLowerCase() !== 'false';
+
+export const failoverBeforeRetry: boolean =
+  (process.env.FAILOVER_BEFORE_RETRY ?? 'true').toLowerCase() !== 'false';
 
 export function classifyComplexity(messages: ChatMessage[]): ComplexityTier {
   const lastUserMessage = messages.filter((m) => m.role === 'user').at(-1);
@@ -32,7 +51,6 @@ export function classifyComplexity(messages: ChatMessage[]): ComplexityTier {
   const tokenCount = countMessagesTokens([lastUserMessage]);
   const historyLength = messages.filter((m) => m.role !== 'system').length;
 
-  // Score-based classification
   if (
     tokenCount > TIER_TOKEN_THRESHOLDS.hard ||
     historyLength > 16 ||
@@ -59,48 +77,40 @@ function matchesKeywords(text: string, keywords: Set<string>): boolean {
   return false;
 }
 
-const TIER_PRIMARY: Record<ComplexityTier, ProviderName> = {
-  hard:   (process.env.TIER_HARD   as ProviderName) ?? 'openai',
-  medium: (process.env.TIER_MEDIUM as ProviderName) ?? 'gemini',
-  simple: (process.env.TIER_SIMPLE as ProviderName) ?? 'groq',
-};
-
-const ALL_PROVIDERS: ProviderName[] = ['openai', 'gemini', 'groq'];
-
-/**
- * Returns the fallback chain for a given tier.
- * The tier's primary provider is always first; remaining providers follow in env-configured order.
- */
 export function getProviderChain(tier: ComplexityTier): ProviderName[] {
   const primary = TIER_PRIMARY[tier];
   const rest = ALL_PROVIDERS.filter((p) => p !== primary);
   return [primary, ...rest];
 }
 
-// ── Forced Priority Mode ─────────────────────────────────────────────────────
-// When FORCED_PRIORITY=true (default), the complexity classifier is bypassed
-// and ALL requests use the fixed PRIORITY_ORDER chain directly.
-// Set FORCED_PRIORITY=false to re-enable the smart hard/medium/simple routing.
-
-export const isForcedPriority: boolean =
-  (process.env.FORCED_PRIORITY ?? 'true').toLowerCase() !== 'false';
-
 function parsePriorityOrder(): ProviderName[] {
   const raw = process.env.PRIORITY_ORDER ?? 'openai,gemini,groq';
   const parsed = raw
     .split(',')
     .map((s) => s.trim().toLowerCase() as ProviderName)
-    .filter((p): p is ProviderName => ALL_PROVIDERS.includes(p as ProviderName));
+    .filter((p): p is ProviderName => ALL_PROVIDERS.includes(p));
 
-  // Ensure all providers are present (append any missing ones at the end)
   const missing = ALL_PROVIDERS.filter((p) => !parsed.includes(p));
   return [...parsed, ...missing];
 }
 
-/**
- * Returns the fixed priority chain from PRIORITY_ORDER env var.
- * Used when FORCED_PRIORITY=true — ignores complexity tier entirely.
- */
 export function getForcedPriorityChain(): ProviderName[] {
   return parsePriorityOrder();
+}
+
+export function buildRoutingStrategy(messages: ChatMessage[]): RoutingStrategy {
+  if (isForcedPriority) {
+    return {
+      tier: 'simple',
+      chain: getForcedPriorityChain(),
+      failoverBeforeRetry,
+    };
+  }
+
+  const tier = classifyComplexity(messages);
+  return {
+    tier,
+    chain: getProviderChain(tier),
+    failoverBeforeRetry,
+  };
 }

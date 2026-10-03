@@ -30,12 +30,12 @@ export class GeminiProvider implements AIProvider {
     return isProviderAvailable('gemini');
   }
 
-  async streamChat(messages: ChatMessage[]): Promise<ReadableStream<Uint8Array>> {
+  async streamChat(messages: ChatMessage[], signal?: AbortSignal, maxTokens = 8192): Promise<ReadableStream<Uint8Array>> {
     const { systemInstruction, contents } = this.translateMessages(messages);
 
     const body: Record<string, unknown> = {
       contents,
-      generationConfig: { maxOutputTokens: 8192 },
+      generationConfig: { maxOutputTokens: maxTokens },
     };
     if (systemInstruction) body.systemInstruction = systemInstruction;
 
@@ -47,14 +47,11 @@ export class GeminiProvider implements AIProvider {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      signal: signal ?? AbortSignal.timeout(30_000),
     });
 
     if (!response.ok) {
       const text = await response.text().catch(() => response.statusText);
-      if (response.status === 429) {
-        recordRateLimit('gemini', 60);
-      }
       throw new Error(`Gemini HTTP ${response.status}: ${text}`);
     }
 
@@ -113,6 +110,7 @@ function createGeminiTokenExtractor(): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = '';
+  let quotaHit = false;
 
   return new TransformStream({
     transform(chunk, controller) {
@@ -135,12 +133,22 @@ function createGeminiTokenExtractor(): TransformStream<Uint8Array, Uint8Array> {
               encoder.encode(`data: ${JSON.stringify({ type: 'token', content: text })}\n\n`),
             );
           }
+          // Gemini signals token cutoff with finishReason: "MAX_TOKENS"
+          const finishReason: string | undefined = parsed?.candidates?.[0]?.finishReason;
+          if (finishReason === 'MAX_TOKENS') {
+            quotaHit = true;
+          }
         } catch {
           // Skip malformed SSE chunks
         }
       }
     },
     flush(controller) {
+      if (quotaHit) {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: 'quota_hit', provider: 'gemini' })}\n\n`),
+        );
+      }
       controller.enqueue(encoder.encode('data: [DONE]\n\n'));
     },
   });
