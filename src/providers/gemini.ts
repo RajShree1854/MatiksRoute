@@ -128,9 +128,15 @@ function createGeminiTokenExtractor(): TransformStream<Uint8Array, Uint8Array> {
           const parsed = JSON.parse(json);
           const text: string | undefined =
             parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+          const functionCall = parsed?.candidates?.[0]?.content?.parts?.[0]?.functionCall;
           if (text) {
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify({ type: 'token', content: text })}\n\n`),
+            );
+          }
+          if (functionCall) {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ type: 'tool_call_started' })}\n\n`),
             );
           }
           // Gemini signals token cutoff with finishReason: "MAX_TOKENS"

@@ -20,7 +20,7 @@ export interface ChatMessage {
 }
 
 export interface RoutingEvent {
-  type: 'meta' | 'token' | 'fallback' | 'mid_stream_failover' | 'done' | 'error';
+  type: 'meta' | 'token' | 'fallback' | 'mid_stream_failover' | 'done' | 'error' | 'tool_call_started';
 }
 
 export interface MetaEvent extends RoutingEvent {
@@ -69,13 +69,18 @@ export interface ErrorEvent extends RoutingEvent {
   message: string;
 }
 
+export interface ToolCallStartedEvent extends RoutingEvent {
+  type: 'tool_call_started';
+}
+
 export type AnyRoutingEvent =
   | MetaEvent
   | TokenEvent
   | FallbackEvent
   | MidStreamFailoverEvent
   | DoneEvent
-  | ErrorEvent;
+  | ErrorEvent
+  | ToolCallStartedEvent;
 
 export interface AIProvider {
   readonly name: ProviderName;

@@ -70,9 +70,15 @@ function createOpenAITokenExtractor(): TransformStream<Uint8Array, Uint8Array> {
         try {
           const parsed = JSON.parse(json);
           const content: string | undefined = parsed?.choices?.[0]?.delta?.content;
+          const toolCalls = parsed?.choices?.[0]?.delta?.tool_calls;
           if (content) {
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify({ type: 'token', content })}\n\n`),
+            );
+          }
+          if (toolCalls) {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ type: 'tool_call_started' })}\n\n`),
             );
           }
         } catch {
