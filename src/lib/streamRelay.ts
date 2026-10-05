@@ -23,6 +23,7 @@ export function createResilientStream(
   (async () => {
     let succeeded = false;
     let accumulatedPartial = '';
+    let lastError = 'All providers exhausted';
 
     for (let i = 0; i < providers.length; i++) {
       const provider = providers[i];
@@ -56,10 +57,6 @@ export function createResilientStream(
           role: 'assistant',
           content: accumulatedPartial,
         });
-        attemptMessages.push({
-          role: 'user',
-          content: 'Continue your previous response exactly from where it was cut off. Do not output any conversational filler, introductory remarks, or formatting like "Sure". Just output the immediate next words of the incomplete sentence.',
-        });
       }
 
       let stream: ReadableStream<Uint8Array>;
@@ -81,6 +78,7 @@ export function createResilientStream(
         nextProvider?.name,
         onEvent,
         options.inputTokens,
+        accumulatedPartial,
         onProviderTokens,
       );
 
@@ -96,11 +94,14 @@ export function createResilientStream(
 
       releaseRequest(provider.name, false);
 
-      if (!result.midStreamFailover || !nextProvider) break;
+      if (!result.midStreamFailover || !nextProvider) {
+        if (result.error) lastError = result.error;
+        break;
+      }
     }
 
     if (!succeeded) {
-      const errEvent: AnyRoutingEvent = { type: 'error', message: 'All providers exhausted' };
+      const errEvent: AnyRoutingEvent = { type: 'error', message: lastError };
       await safeWrite(writer, encoder.encode(`data: ${JSON.stringify(errEvent)}\n\n`));
     }
 
@@ -111,10 +112,20 @@ export function createResilientStream(
   return readable;
 }
 
+function trimContinuationOverlap(emitted: string, continuation: string): string {
+  if (!continuation || !emitted) return continuation;
+  const max = Math.min(emitted.length, continuation.length, 512);
+  for (let k = max; k > 0; k--) {
+    if (emitted.endsWith(continuation.slice(0, k))) return continuation.slice(k);
+  }
+  return continuation;
+}
+
 interface DrainResult {
   succeeded: boolean;
   midStreamFailover: boolean;
   streamedText: string;
+  error?: string;
 }
 
 async function drainStream(
@@ -124,6 +135,7 @@ async function drainStream(
   nextProvider: ProviderName | undefined,
   onEvent: (event: AnyRoutingEvent) => void,
   inputTokens: number,
+  previousTextToTrim: string,
   onProviderTokens?: (provider: ProviderName, outputTokens: number) => void,
 ): Promise<DrainResult> {
   const encoder = new TextEncoder();
@@ -132,6 +144,9 @@ async function drainStream(
   let tokensStreamed = 0;
   let accumulatedText = '';
   let tpmExhausted = false;
+  let toolCallInFlight = false;
+  let overlapTrimmed = !previousTextToTrim;
+  let bufferedContinuation = '';
 
   const maxOutputTokens = Math.max(0, getRemainingTpm(currentProvider) - inputTokens);
 
@@ -140,9 +155,13 @@ async function drainStream(
 
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
-
-      await safeWrite(writer, value);
+      if (done) {
+        if (!overlapTrimmed && bufferedContinuation) {
+          const trimmed = trimContinuationOverlap(previousTextToTrim, bufferedContinuation);
+          if (trimmed) await safeWrite(writer, encoder.encode(`data: ${JSON.stringify({ type: 'token', content: trimmed })}\n\n`));
+        }
+        break;
+      }
 
       lineBuffer += decoder.decode(value, { stream: true });
       const lines = lineBuffer.split('\n');
@@ -153,17 +172,36 @@ async function drainStream(
         if (!trimmed.startsWith('data:')) continue;
         const json = trimmed.slice(5).trim();
         if (!json || json === '[DONE]') continue;
+        
         try {
           const parsed = JSON.parse(json);
-          if (parsed?.type === 'token' && typeof parsed.content === 'string') {
+          if (parsed?.type === 'tool_call_started') {
+            toolCallInFlight = true;
+            await safeWrite(writer, encoder.encode(`data: ${json}\n\n`));
+          } else if (parsed?.type === 'token' && typeof parsed.content === 'string') {
             tokensStreamed++;
             accumulatedText += parsed.content;
+
+            if (!overlapTrimmed) {
+              bufferedContinuation += parsed.content;
+              if (bufferedContinuation.length >= 100) {
+                const trimmedToken = trimContinuationOverlap(previousTextToTrim, bufferedContinuation);
+                if (trimmedToken) {
+                  await safeWrite(writer, encoder.encode(`data: ${JSON.stringify({ type: 'token', content: trimmedToken })}\n\n`));
+                }
+                overlapTrimmed = true;
+              }
+            } else {
+              await safeWrite(writer, encoder.encode(`data: ${json}\n\n`));
+            }
 
             if (nextProvider && tokensStreamed >= maxOutputTokens) {
               tpmExhausted = true;
               reader.cancel().catch(() => undefined);
               break;
             }
+          } else {
+            await safeWrite(writer, encoder.encode(`data: ${json}\n\n`));
           }
         } catch { /* skip */ }
       }
@@ -174,6 +212,9 @@ async function drainStream(
     onProviderTokens?.(currentProvider, tokensStreamed);
 
     if (tpmExhausted && nextProvider) {
+      if (toolCallInFlight) {
+        return { succeeded: false, midStreamFailover: false, streamedText: accumulatedText, error: 'Mid-stream failover refused: tool-call in flight' };
+      }
       const failoverEvent: AnyRoutingEvent = {
         type: 'mid_stream_failover',
         from: currentProvider,
@@ -186,11 +227,12 @@ async function drainStream(
     }
 
     return { succeeded: true, midStreamFailover: false, streamedText: accumulatedText };
-  } catch {
+  } catch (err) {
     onProviderTokens?.(currentProvider, tokensStreamed);
 
-    if (!nextProvider) {
-      return { succeeded: false, midStreamFailover: false, streamedText: accumulatedText };
+    if (!nextProvider || toolCallInFlight) {
+      const errorMsg = toolCallInFlight ? 'Mid-stream failover refused: tool-call in flight' : (err instanceof Error ? err.message : String(err));
+      return { succeeded: false, midStreamFailover: false, streamedText: accumulatedText, error: errorMsg };
     }
 
     const failoverEvent: AnyRoutingEvent = {

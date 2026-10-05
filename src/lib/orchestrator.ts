@@ -51,7 +51,11 @@ export interface OrchestratorResult {
   stream: ReadableStream<Uint8Array>;
 }
 
-export async function route(messages: ChatMessage[]): Promise<OrchestratorResult> {
+export async function route(
+  messages: ChatMessage[],
+  expectedTokens?: number,
+  isCode?: boolean,
+): Promise<OrchestratorResult> {
   const startTime = Date.now();
   const encoder = new TextEncoder();
 
@@ -64,9 +68,17 @@ export async function route(messages: ChatMessage[]): Promise<OrchestratorResult
   } = compressMessages(messages, { mode: compressionMode });
 
   const strategy = buildRoutingStrategy(compressed);
-  const { tier, chain, failoverBeforeRetry } = strategy;
+  const { tier, chain } = strategy;
+  const failoverBeforeRetry = isCode === true ? false : strategy.failoverBeforeRetry;
 
-  const estimatedTotalTokens = Math.max(compressedTokens * 3, 100);
+  let estimatedTotalTokens = expectedTokens;
+  if (typeof estimatedTotalTokens !== 'number' || estimatedTotalTokens <= 0) {
+    if (isCode) {
+      estimatedTotalTokens = tier === 'hard' ? 4000 : tier === 'medium' ? 2000 : 1000;
+    } else {
+      estimatedTotalTokens = Math.max(compressedTokens * 3, 100);
+    }
+  }
 
   const capacityFiltered = chain.filter(
     (p) => isProviderAvailable(p) && hasCapacityFor(p, estimatedTotalTokens),

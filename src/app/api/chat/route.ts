@@ -7,6 +7,8 @@ export const dynamic = 'force-dynamic';
 
 interface ChatRequestBody {
   messages: ChatMessage[];
+  expected_tokens?: number;
+  is_code?: boolean;
 }
 
 function isValidMessages(value: unknown): value is ChatMessage[] {
@@ -41,7 +43,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   try {
-    const { stream } = await route(body.messages);
+    const { stream } = await route(body.messages, body.expected_tokens, body.is_code);
 
     return new Response(stream, {
       headers: {
