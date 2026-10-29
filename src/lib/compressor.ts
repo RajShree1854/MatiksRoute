@@ -1,5 +1,6 @@
 import { ChatMessage } from '@/providers/types';
 import { countMessagesTokens, countTokens } from '@/lib/tokenizer';
+import { cavemanCompressMessages } from '@/lib/caveman';
 
 export type CompressionMode = 'off' | 'lite' | 'auto';
 
@@ -18,6 +19,10 @@ export interface CompressResult {
 const DEFAULT_MAX_HISTORY = 12;
 const AUTO_TRIGGER_THRESHOLD = 2_000;
 
+function isCavemanEnabled(): boolean {
+  return (process.env.CAVEMAN_COMPRESSION ?? 'true').toLowerCase() !== 'false';
+}
+
 export function compressMessages(
   messages: ChatMessage[],
   config: CompressionConfig = { mode: 'auto' },
@@ -32,6 +37,7 @@ export function compressMessages(
   const maxHistory = config.maxHistoryMessages ?? DEFAULT_MAX_HISTORY;
   let result = deduplicateSystemPrompts(messages);
   result = normalizeWhitespace(result);
+  if (isCavemanEnabled()) result = cavemanCompressMessages(result);
   result = collapseHistory(result, maxHistory);
 
   const compressedTokens = countMessagesTokens(result);
