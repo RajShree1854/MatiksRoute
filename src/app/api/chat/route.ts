@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { route } from '@/lib/orchestrator';
+import { route, GuardrailBlockedError } from '@/lib/orchestrator';
 import { ChatMessage } from '@/providers/types';
 
 export const runtime = 'nodejs';
@@ -54,6 +54,12 @@ export async function POST(req: NextRequest): Promise<Response> {
       },
     });
   } catch (err) {
+    if (err instanceof GuardrailBlockedError) {
+      return new Response(
+        JSON.stringify({ error: 'Request blocked by security policy', rule: err.ruleId }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
     const message = err instanceof Error ? err.message : 'Internal gateway error';
     return new Response(JSON.stringify({ error: message }), {
       status: 503,

@@ -13,6 +13,7 @@ import {
   RequestLog,
 } from '@/providers/types';
 import { compressMessages, CompressionMode } from '@/lib/compressor';
+import { applyGuardrails, summarizeViolations } from '@/lib/guardrails';
 import { buildRoutingStrategy, isForcedPriority } from '@/lib/classifier';
 import {
   isProviderAvailable,
@@ -51,6 +52,15 @@ export interface OrchestratorResult {
   stream: ReadableStream<Uint8Array>;
 }
 
+export class GuardrailBlockedError extends Error {
+  readonly ruleId: string;
+  constructor(ruleId: string) {
+    super(`Request blocked by guardrail: ${ruleId}`);
+    this.name = 'GuardrailBlockedError';
+    this.ruleId = ruleId;
+  }
+}
+
 export async function route(
   messages: ChatMessage[],
   expectedTokens?: number,
@@ -59,173 +69,183 @@ export async function route(
   const startTime = Date.now();
   const encoder = new TextEncoder();
 
+  const guardrailResult = applyGuardrails(messages);
+  if (guardrailResult.blocked) {
+    throw new GuardrailBlockedError(guardrailResult.blockReason ?? 'unknown');
+  }
+
+  const safeMessages = guardrailResult.messages;
+  const guardrailSummary = guardrailResult.redacted
+    ? summarizeViolations(guardrailResult.violations)
+    : null;
+
   const compressionMode = resolveCompressionMode();
   const {
     messages: compressed,
     originalTokens,
     compressedTokens,
     mode: appliedMode,
-  } = compressMessages(messages, { mode: compressionMode });
+} = compressMessages(safeMessages, { mode: compressionMode });
 
-  const strategy = buildRoutingStrategy(compressed);
-  const { tier, chain } = strategy;
-  const failoverBeforeRetry = isCode === true ? false : strategy.failoverBeforeRetry;
+const strategy = buildRoutingStrategy(compressed);
+const { tier, chain } = strategy;
+const failoverBeforeRetry = isCode === true ? false : strategy.failoverBeforeRetry;
 
-  let estimatedTotalTokens = expectedTokens;
-  if (typeof estimatedTotalTokens !== 'number' || estimatedTotalTokens <= 0) {
-    if (isCode) {
-      estimatedTotalTokens = tier === 'hard' ? 4000 : tier === 'medium' ? 2000 : 1000;
-    } else {
-      estimatedTotalTokens = Math.max(compressedTokens * 3, 100);
+let estimatedTotalTokens = expectedTokens;
+if (typeof estimatedTotalTokens !== 'number' || estimatedTotalTokens <= 0) {
+  if (isCode) {
+    estimatedTotalTokens = tier === 'hard' ? 4000 : tier === 'medium' ? 2000 : 1000;
+  } else {
+    estimatedTotalTokens = Math.max(compressedTokens * 3, 100);
+  }
+}
+
+const capacityFiltered = chain.filter(
+  (p) => isProviderAvailable(p) && hasCapacityFor(p, estimatedTotalTokens),
+);
+
+const effectiveChain = isForcedPriority
+  ? capacityFiltered
+  : capacityFiltered.length > 0
+    ? selectByHeadroom(capacityFiltered)
+    : chain.filter(isProviderAvailable);
+
+const finalChain = effectiveChain.length > 0 ? effectiveChain : chain;
+
+const primaryProvider = finalChain[0];
+const providers = buildProviders();
+
+const contextLimit = MODEL_CONTEXT_LIMIT[primaryProvider];
+const trimmedMessages = trimMessagesToTokenBudget(compressed, contextLimit);
+
+const { messages: processedMessages, hadImages, imageAction } =
+  await processMessagesForProvider(trimmedMessages, providers[primaryProvider]);
+
+const collectedEvents: AnyRoutingEvent[] = [];
+
+const metaEvent: MetaEvent = {
+  type: 'meta',
+  tier,
+  provider: primaryProvider,
+  hadImages,
+  imageAction: imageAction as ImageAction,
+  originalTokens,
+  compressedTokens,
+  compressionMode: appliedMode,
+  failoverBeforeRetry,
+};
+
+const remainingBudgets: Record<string, number> = {};
+for (const p of finalChain) {
+  remainingBudgets[p] = getRemainingTpm(p);
+}
+
+const aiProviderChain = finalChain.map((name) => providers[name]);
+const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+const writer = writable.getWriter();
+
+const perProviderTokens = new Map<ProviderName, number>();
+
+(async () => {
+  await writer.write(encoder.encode(`data: ${JSON.stringify(metaEvent)}\n\n`));
+
+  const relayStream = createResilientStream(aiProviderChain, processedMessages, {
+    onEvent: (event) => {
+      collectedEvents.push(event);
+    },
+    failoverBeforeRetry,
+    onProviderTokens: (provider, tokens) => {
+      perProviderTokens.set(provider, (perProviderTokens.get(provider) ?? 0) + tokens);
+    },
+    inputTokens: compressedTokens,
+  });
+
+  const reader = relayStream.getReader();
+  const lineDecoder = new TextDecoder();
+  let lineBuffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await writer.write(value);
+
+    lineBuffer += lineDecoder.decode(value, { stream: true });
+    const lines = lineBuffer.split('\n');
+    lineBuffer = lines.pop() ?? '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const json = trimmed.slice(5).trim();
+      if (!json || json === '[DONE]') continue;
+      try {
+        const parsed = JSON.parse(json);
+        if (parsed?.type === 'token' && typeof parsed.content === 'string') {
+          /* token counting is now done inside the relay per-provider */
+        }
+      } catch { /* skip */ }
     }
   }
 
-  const capacityFiltered = chain.filter(
-    (p) => isProviderAvailable(p) && hasCapacityFor(p, estimatedTotalTokens),
-  );
+  const fallbackEvents = collectedEvents.filter((e) => e.type === 'fallback') as FallbackEvent[];
+  const midStreamEvents = collectedEvents.filter((e) => e.type === 'mid_stream_failover');
+  const latencyMs = Date.now() - startTime;
 
-  const effectiveChain = isForcedPriority
-    ? capacityFiltered
-    : capacityFiltered.length > 0
-      ? selectByHeadroom(capacityFiltered)
-      : chain.filter(isProviderAvailable);
+  const actualProvider: ProviderName =
+    fallbackEvents.length > 0
+      ? fallbackEvents[fallbackEvents.length - 1].to
+      : primaryProvider;
 
-  const finalChain = effectiveChain.length > 0 ? effectiveChain : chain;
+  let totalTokensUsed = 0;
+  for (const [provider, tokens] of perProviderTokens) {
+    const totalForProvider = compressedTokens + tokens;
+    recordUsage(provider as ProviderName, totalForProvider);
+    totalTokensUsed += totalForProvider;
+  }
 
-  const primaryProvider = finalChain[0];
-  const providers = buildProviders();
+  if (perProviderTokens.size === 0) {
+    totalTokensUsed = compressedTokens;
+    recordUsage(actualProvider, compressedTokens);
+  }
 
-  const contextLimit = MODEL_CONTEXT_LIMIT[primaryProvider];
-  const trimmedMessages = trimMessagesToTokenBudget(compressed, contextLimit);
+  const doneEvent: DoneEvent = {
+    type: 'done',
+    provider: actualProvider,
+    latencyMs,
+    tokensUsed: totalTokensUsed,
+    fallbackCount: fallbackEvents.length,
+    midStreamFailover: midStreamEvents.length > 0,
+  };
 
-  const { messages: processedMessages, hadImages, imageAction } =
-    await processMessagesForProvider(trimmedMessages, providers[primaryProvider]);
+  await writer.write(encoder.encode(`data: ${JSON.stringify(doneEvent)}\n\n`));
+  await writer.close().catch(() => undefined);
 
-  const collectedEvents: AnyRoutingEvent[] = [];
+  const errorEvents = collectedEvents.filter(
+    (e) => e.type === 'error',
+  ) as { type: 'error'; message: string }[];
+  const errorReason = errorEvents.length > 0 ? errorEvents.map((e) => e.message).join(' | ') : null;
 
-  const metaEvent: MetaEvent = {
-    type: 'meta',
-    tier,
-    provider: primaryProvider,
+  scheduleLog({
+    timestamp: new Date().toISOString(),
+    complexityTier: tier,
+    smartRouteTarget: primaryProvider,
+    providerAttempted: finalChain.join(' → '),
+    providerSucceeded: actualProvider,
+    fallbackTriggered: fallbackEvents.length > 0,
+    midStreamFailover: midStreamEvents.length > 0,
     hadImages,
     imageAction: imageAction as ImageAction,
     originalTokens,
     compressedTokens,
-    compressionMode: appliedMode,
-    failoverBeforeRetry,
-  };
+    tokensSavedPct:
+      originalTokens > 0
+        ? ((originalTokens - compressedTokens) / originalTokens) * 100
+        : 0,
+    latencyMs,
+    errorReason: [guardrailSummary, errorReason].filter(Boolean).join(' | ') || null,
+  });
+})();
 
-  const remainingBudgets: Record<string, number> = {};
-  for (const p of finalChain) {
-    remainingBudgets[p] = getRemainingTpm(p);
-  }
-
-  const aiProviderChain = finalChain.map((name) => providers[name]);
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-  const writer = writable.getWriter();
-
-  const perProviderTokens = new Map<ProviderName, number>();
-
-  (async () => {
-    await writer.write(encoder.encode(`data: ${JSON.stringify(metaEvent)}\n\n`));
-
-    const relayStream = createResilientStream(aiProviderChain, processedMessages, {
-      onEvent: (event) => {
-        collectedEvents.push(event);
-      },
-      failoverBeforeRetry,
-      onProviderTokens: (provider, tokens) => {
-        perProviderTokens.set(provider, (perProviderTokens.get(provider) ?? 0) + tokens);
-      },
-      inputTokens: compressedTokens,
-    });
-
-    const reader = relayStream.getReader();
-    const lineDecoder = new TextDecoder();
-    let lineBuffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      await writer.write(value);
-
-      lineBuffer += lineDecoder.decode(value, { stream: true });
-      const lines = lineBuffer.split('\n');
-      lineBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const json = trimmed.slice(5).trim();
-        if (!json || json === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(json);
-          if (parsed?.type === 'token' && typeof parsed.content === 'string') {
-            /* token counting is now done inside the relay per-provider */
-          }
-        } catch { /* skip */ }
-      }
-    }
-
-    const fallbackEvents = collectedEvents.filter((e) => e.type === 'fallback') as FallbackEvent[];
-    const midStreamEvents = collectedEvents.filter((e) => e.type === 'mid_stream_failover');
-    const latencyMs = Date.now() - startTime;
-
-    const actualProvider: ProviderName =
-      fallbackEvents.length > 0
-        ? fallbackEvents[fallbackEvents.length - 1].to
-        : primaryProvider;
-
-    let totalTokensUsed = 0;
-    for (const [provider, tokens] of perProviderTokens) {
-      const totalForProvider = compressedTokens + tokens;
-      recordUsage(provider as ProviderName, totalForProvider);
-      totalTokensUsed += totalForProvider;
-    }
-
-    if (perProviderTokens.size === 0) {
-      totalTokensUsed = compressedTokens;
-      recordUsage(actualProvider, compressedTokens);
-    }
-
-    const doneEvent: DoneEvent = {
-      type: 'done',
-      provider: actualProvider,
-      latencyMs,
-      tokensUsed: totalTokensUsed,
-      fallbackCount: fallbackEvents.length,
-      midStreamFailover: midStreamEvents.length > 0,
-    };
-
-    await writer.write(encoder.encode(`data: ${JSON.stringify(doneEvent)}\n\n`));
-    await writer.close().catch(() => undefined);
-
-    const errorEvents = collectedEvents.filter(
-      (e) => e.type === 'error',
-    ) as { type: 'error'; message: string }[];
-    const errorReason = errorEvents.length > 0 ? errorEvents.map((e) => e.message).join(' | ') : null;
-
-    scheduleLog({
-      timestamp: new Date().toISOString(),
-      complexityTier: tier,
-      smartRouteTarget: primaryProvider,
-      providerAttempted: finalChain.join(' → '),
-      providerSucceeded: actualProvider,
-      fallbackTriggered: fallbackEvents.length > 0,
-      midStreamFailover: midStreamEvents.length > 0,
-      hadImages,
-      imageAction: imageAction as ImageAction,
-      originalTokens,
-      compressedTokens,
-      tokensSavedPct:
-        originalTokens > 0
-          ? ((originalTokens - compressedTokens) / originalTokens) * 100
-          : 0,
-      latencyMs,
-      errorReason,
-    });
-  })();
-
-  return { stream: readable };
+return { stream: readable };
 }
 
 function scheduleLog(log: Omit<RequestLog, 'id'>): void {
